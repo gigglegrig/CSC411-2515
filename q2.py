@@ -1,112 +1,253 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Sep 12 20:39:09 2017
-
-"""
-from __future__ import print_function
-import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.datasets import load_boston
-from scipy.misc import logsumexp
 
-np.random.seed(0)
+from sklearn.datasets import fetch_mldata
+import matplotlib.pyplot as plt
 
-# load boston housing prices dataset
-boston = load_boston()
-x = boston['data']
-N = x.shape[0]
-x = np.concatenate((np.ones((506, 1)), x), axis=1)  # add constant one feature - no bias needed
-d = x.shape[1]
-y = boston['target']
-
-idx = np.random.permutation(range(N))
+np.random.seed(1847)
 
 
-# helper function
-def l2(A, B):
+class BatchSampler(object):
     '''
-    Input: A is a Nxd matrix
-           B is a Mxd matirx
-    Output: dist is a NxM matrix where dist[i,j] is the square norm between A[i,:] and B[j,:]
-    i.e. dist[i,j] = ||A[i,:]-B[j,:]||^2
+    A (very) simple wrapper to randomly sample batches without replacement.
+
+    You shouldn't need to touch this.
     '''
-    A_norm = (A ** 2).sum(axis=1).reshape(A.shape[0], 1)
-    B_norm = (B ** 2).sum(axis=1).reshape(1, B.shape[0])
-    dist = A_norm + B_norm - 2 * A.dot(B.transpose())
-    return dist
+
+    def __init__(self, data, targets, batch_size):
+        self.num_points = data.shape[0]
+        self.features = data.shape[1]
+        self.batch_size = batch_size
+
+        self.data = data
+        self.targets = targets
+
+        self.indices = np.arange(self.num_points)
+
+    def random_batch_indices(self, m=None):
+        '''
+        Get random batch indices without replacement from the dataset.
+
+        If m is given the batch will be of size m. Otherwise will default to the class initialized value.
+        '''
+        if m is None:
+            indices = np.random.choice(self.indices, self.batch_size, replace=False)
+        else:
+            indices = np.random.choice(self.indices, m, replace=False)
+        return indices
+
+    def get_batch(self, m=None):
+        '''
+        Get a random batch without replacement from the dataset.
+
+        If m is given the batch will be of size m. Otherwise will default to the class initialized value.
+        '''
+        indices = self.random_batch_indices(m)
+        X_batch = np.take(self.data, indices, 0)
+        y_batch = self.targets[indices]
+        return X_batch, y_batch
 
 
-# helper function
-def run_on_fold(x_test, y_test, x_train, y_train, taus):
+class GDOptimizer(object):
     '''
-    Input: x_test is the N_test x d design matrix
-           y_test is the N_test x 1 targets vector
-           x_train is the N_train x d design matrix
-           y_train is the N_train x 1 targets vector
-           taus is a vector of tau values to evaluate
-    output: losses a vector of average losses per fold, one for each tau value
+    A gradient descent optimizer with momentum
     '''
-    N_test = x_test.shape[0]
-    losses = np.zeros(taus.shape)
-    for j, tau in enumerate(taus):
-        predictions = np.array([LRLS(x_test[i, :].reshape(d, 1), x_train, y_train, tau) \
-                                for i in range(N_test)])
-        losses[j] = ((predictions.flatten() - y_test.flatten()) ** 2).mean()
-    return losses
+
+    def __init__(self, lr, beta=0.0):
+        self.lr = lr
+        self.beta = beta
+        self.update = 0
+
+    def update_params(self, params, grad):
+        # Update parameters using GD with momentum and return
+        # the updated parameters
+        self.update = self.beta * self.update - self.lr * grad
+        params += self.update
+        return params
 
 
-# to implement
-def LRLS(test_datum, x_train, y_train, tau, lam=1e-5):
+class SVM(object):
     '''
-    Input: test_datum is a dx1 test vector
-           x_train is the N_train x d design matrix
-           y_train is the N_train x 1 targets vector
-           tau is the local reweighting parameter, single scalar per call.
-           lam is the regularization parameter, CONST
-    output is y_hat the prediction on test_datum, scalar valued.
+    A Support Vector Machine
     '''
-    Ai = (np.sum((x_train - test_datum.T) ** 2, axis=1) / (-2 * (tau ** 2)))  # Ai.shape = (N*1)
-    B = np.amax(Ai)
-    ai = np.exp(Ai - B) / np.exp(logsumexp(Ai - B))
-    A = np.diagflat(ai)
-    LHS = x_train.T.dot(A).dot(x_train) + lam * np.eye(x_train.shape[1])
-    RHS = x_train.T.dot(A).dot(y_train)
-    w = np.linalg.solve(LHS, RHS)  # shape: (14*1)
-    y_hat = w.dot(test_datum)
 
-    return y_hat
+    def __init__(self, c, feature_count):
+        self.c = c
+        self.w = np.random.normal(0.0, 0.1, feature_count)
+
+    def hinge_loss(self, X, y):
+        '''
+        Compute the hinge-loss for input data X (shape (n, m)) with target y (shape (n,)).
+
+        Returns a length-n vector containing the hinge-loss per data point.
+        '''
+        # Implement hinge loss
+        loss = 1 - X.dot((self.w).T) * y
+        loss[loss < 0] = 0
+
+        return loss
+
+    def grad(self, X, y):
+        '''
+        Compute the gradient of the SVM objective for input data X (shape (n, m))
+        with target y (shape (n,))
+
+        Returns the gradient with respect to the SVM parameters (shape (m,)).
+        '''
+        # Compute (sub-)gradient of SVM objective
+        N = X.shape[0]
+        w = [x for x in self.w]
+        w[-1] = 0
+        loss = self.hinge_loss(X, y)
+        loss_grad = self.w - self.c / N * np.sum(X[loss > 0] * y[loss > 0][:, np.newaxis], axis=0)
+
+        return loss_grad
+
+    def classify(self, X):
+        '''
+        Classify new input data matrix (shape (n,m)).
+
+        Returns the predicted class labels (shape (n,))
+        '''
+        # Classify points as +1 or -1
+        y = np.sign(X.dot(self.w))
+        return y
 
 
-def run_k_fold(x, y, taus, k):
+def load_data():
     '''
-    Input: x is the N x d design matrix
-           y is the N x 1 targets vector
-           taus is a vector of tau values to evaluate
-           K in the number of folds
-    output is losses a vector of k-fold cross validation losses one for each tau value
+    Load MNIST data (4 and 9 only) and split into train and test
     '''
-    losses = np.zeros(taus.shape[0])
-    fold_size = round(N / k)  # 506/5=101
-    # In each fold, choose indice from the randomlized idx with random.seed(0)
-    for i in range(k):  # 0 1 2 3 4
-        test_idx = idx[i * fold_size: (i + 1) * fold_size]
-        train_idx = [x for x in idx if x not in test_idx]
-        test_x = x[test_idx]
-        test_y = y[test_idx]
-        train_x = x[train_idx]
-        train_y = y[train_idx]
-        losses += run_on_fold(test_x, test_y, train_x, train_y, taus)  # += for avg losses of each fold
+    mnist = fetch_mldata('MNIST original', data_home='./data')
+    label_4 = (mnist.target == 4)
+    label_9 = (mnist.target == 9)
 
-    return losses / k
+    data_4, targets_4 = mnist.data[label_4], np.ones(np.sum(label_4))
+    data_9, targets_9 = mnist.data[label_9], -np.ones(np.sum(label_9))
+
+    data = np.concatenate([data_4, data_9], 0)
+    data = data / 255.0
+    targets = np.concatenate([targets_4, targets_9], 0)
+
+    permuted = np.random.permutation(data.shape[0])
+    train_size = int(np.floor(data.shape[0] * 0.8))
+
+    train_data, train_targets = data[permuted[:train_size]], targets[permuted[:train_size]]
+    test_data, test_targets = data[permuted[train_size:]], targets[permuted[train_size:]]
+    print("Data Loaded")
+    print("Train size: {}".format(train_size))
+    print("Test size: {}".format(data.shape[0] - train_size))
+    print("-------------------------------")
+    return train_data, train_targets, test_data, test_targets
 
 
-if __name__ == "__main__":
-    # In this exercise we fixed lambda (hard coded to 1e-5) and only set tau value. Feel free to play with lambda as well if you wish
-    taus = np.logspace(1.0, 3, 200)
-    losses = run_k_fold(x, y, taus, k=5)
-    plt.plot(taus, losses)
-    plt.xlabel("taus")
-    plt.ylabel("losses")
-    plt.title("avg losses vs. taus")
+def optimize_test_function(optimizer, w_init=10.0, steps=200):
+    '''
+    Optimize the simple quadratic test function and return the parameter history.
+    '''
+
+    def func(x):
+        return 0.01 * x * x
+
+    def func_grad(x):
+        return 0.02 * x
+
+    w = w_init
+    w_history = [w_init]
+
+    for i in range(steps):
+        # Optimize and update the history
+        w = optimizer.update_params(w, func_grad(w))
+        w_history.append(w)
+    return w_history
+
+
+def optimize_svm(train_data, train_targets, penalty, optimizer, batchsize, iters):
+    '''
+    Optimize the SVM with the given hyperparameters. Return the trained SVM.
+    '''
+    M = train_data.shape[1]
+    params = np.zeros(M)
+    svm_clf = SVM(penalty, M)
+    batch_sampler = BatchSampler(train_data, train_targets, batchsize)
+
+    for i in range(iters):
+        # get batch X,y
+        X, y = batch_sampler.get_batch()
+        params = optimizer.update_params(params, svm_clf.grad(X, y))
+        svm_clf.w = params
+
+    return svm_clf
+
+
+def plot_w(w):
+    w_matrix = np.reshape(w, (28, 28))
+    plt.imshow(w_matrix, cmap='gray')
     plt.show()
-    print("min loss = {}".format(losses.min()))
+
+
+if __name__ == '__main__':
+    # Part 1
+    # a=1 b=0
+    optimizer1 = GDOptimizer(1, 0)
+    w1 = optimize_test_function(optimizer1)
+    # a=1 b=0.9
+    optimizer2 = GDOptimizer(1, 0.9)
+    w2 = optimize_test_function(optimizer2)
+
+    x_ticks = list(range(201))
+    plt.plot(x_ticks, w1, label='b=0.9')
+    plt.plot(x_ticks, w2, label='b=0')
+    plt.title('With/Without Momentum')
+    plt.legend()
+    plt.show()
+    # Part 2 & 3
+    # Load data
+    train_data, train_targets, test_data, test_targets = load_data()
+    train_size, test_size = train_data.shape[0], test_data.shape[0]
+    # add bias column as last column
+    train_biased = np.append(train_data, np.ones(train_size)[:, np.newaxis], axis=1)
+    test_biased = np.append(test_data, np.ones(test_size)[:, np.newaxis], axis=1)
+
+    # set optimizers for 2 models
+    svm_optimizer1 = GDOptimizer(0.01, 0)
+    svm_optimizer2 = GDOptimizer(0.01, 0.1)
+    # return the trained models with each optimizer
+    svm_clf1 = optimize_svm(train_biased, train_targets, penalty=1, optimizer=svm_optimizer1, batchsize=100, iters=500)
+    # return loss1
+    train_loss1 = svm_clf1.hinge_loss(train_biased, train_targets)
+    test_loss1 = svm_clf1.hinge_loss(test_biased, test_targets)
+    # predict and return train accuracy
+    train_pred1 = svm_clf1.classify(train_biased)
+    train_accuracy1 = np.mean(train_pred1 == train_targets)
+    # predict and return test accuracy
+    test_pred1 = svm_clf1.classify(test_biased)
+    test_accuracy1 = np.mean(test_pred1 == test_targets)
+    # plot weights as graph
+    plot_w(svm_clf1.w[:-1])
+    plt.title('w with beta=0')
+    print('For Model with beta=0:\n \
+          Train accuracy: {}\n \
+          Test accuracy: {}\n \
+          Avg train hinge loss: {}\n\
+          Avg test hinge loss: {}\n'.format(train_accuracy1, test_accuracy1, \
+                                            np.mean(train_loss1), np.mean(test_loss1)))
+    # train model with optimizer2
+    svm_clf2 = optimize_svm(train_biased, train_targets, penalty=1, optimizer=svm_optimizer2, batchsize=100, iters=500)
+    # return the train and test hinge losses
+    train_loss2 = svm_clf2.hinge_loss(train_biased, train_targets)
+    test_loss2 = svm_clf2.hinge_loss(test_biased, test_targets)
+    # predict and return train accuracy
+    train_pred2 = svm_clf1.classify(train_biased)
+    train_accuracy2 = np.mean(train_pred2 == train_targets)
+    # predict and return test accuracy
+    test_pred2 = svm_clf2.classify(test_biased)
+    test_accuracy2 = np.mean(test_pred2 == test_targets)
+    # plot the weights as graph
+    plot_w(svm_clf2.w[:-1])
+    plt.title('w with beta=0.1')
+    print('For Model with beta=0.1:\n\
+          Train accuracy: {}\n\
+          Test accuracy: {}\n\
+          Avg train hinge loss: {}\n\
+          Avg test hinge loss: {}\n'.format(train_accuracy2, test_accuracy2, \
+                                            np.mean(train_loss2), np.mean(test_loss2)))
